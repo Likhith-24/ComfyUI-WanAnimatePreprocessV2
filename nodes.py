@@ -1957,7 +1957,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["default", "expression_lock", "jitterless", "auto"], {"default": "default", "tooltip": "How the face crop box is built. Four modes, no more - the ones that measured well and the ones you asked to keep.\n\ndefault = the REFERENCE behaviour, byte for byte with Wan2.2's own process_pipepline.py: per-frame face-tight box, no smoothing of anything. Measured 1.09px of face wander inside the 512 tile and 100% face-fill. This is the safe choice and the one to A/B against.\n\nexpression_lock = the reference box with the centre taken RAW per frame and only the box SIZE stabilised, so the tile stops breathing. Measured 1.18px wander, 100% fill - statistically the same as default, with a steadier tile size.\n\njitterless = locked constant-size crop, Mocha-style planar hold. Steadiest tile SIZE of all, at the cost of face-fill when the subject moves toward or away from camera.\n\nauto = legacy motion-adaptive smoothing with an optional constant-size box. The most forgiving on very jittery handheld, the least faithful on subtle expression.\n\nRETIRED: central_face and reference_smooth. Both still RUN if a saved workflow selects them, but they are no longer offered - central_face crops eyebrow-to-mouth only, which starves an already small face, and reference_smooth filters the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan) and spends Wan-Animate's 20-number face budget on rigid motion instead of expression.\n\nNOTE: the mode matters far less than the face RESOLUTION. If your face box is under ~160px the tile is mostly invented pixels and no mode fixes that - wire a full-res plate to hires_images."}),
+                "crop_mode": (["default", "expression_lock", "jitterless", "auto", "action"], {"default": "default", "tooltip": "How the face crop box is built. Five modes - the ones that measured well and the ones you asked to keep.\n\ndefault = the REFERENCE behaviour, byte for byte with Wan2.2's own process_pipepline.py: per-frame face-tight box, no smoothing of anything. Measured 1.09px of face wander inside the 512 tile and 100% face-fill. This is the safe choice and the one to A/B against.\n\nexpression_lock = the reference box with the centre taken RAW per frame and only the box SIZE stabilised, so the tile stops breathing. Measured 1.18px wander, 100% fill - statistically the same as default, with a steadier tile size.\n\njitterless = locked constant-size crop, Mocha-style planar hold. Steadiest tile SIZE of all, at the cost of face-fill when the subject moves toward or away from camera.\n\nauto = legacy motion-adaptive smoothing with an optional constant-size box. The most forgiving on very jittery handheld, the least faithful on subtle expression.action = for DANCE / fast body action with a moving camera. Constant-size box on a HOLD-THEN-JUMP path: the crop sits perfectly still through jitter and through a fast limb move, then relocates in one discrete jump once the subject has genuinely travelled. It never tracks continuously, which is what makes it different from jitterless - jitterless one-euro-filters the CENTRE, and on a sustained pan that filter lags the whole way (the same mechanism that got reference_smooth retired at 26-61px of drift). Cost: the box must be LARGER than the face to have room to hold, so face-fill is lower than default by construction - measured 57% vs default 100% on a synthetic dance+pan rig, with 6 jumps over 96 frames instead of 96. Use it when a steady tile matters more than maximum face pixels; use default when the camera is locked off.\n\nRETIRED: central_face and reference_smooth. Both still RUN if a saved workflow selects them, but they are no longer offered - central_face crops eyebrow-to-mouth only, which starves an already small face, and reference_smooth filters the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan) and spends Wan-Animate's 20-number face budget on rigid motion instead of expression.\n\nNOTE: the mode matters far less than the face RESOLUTION. If your face box is under ~160px the tile is mostly invented pixels and no mode fixes that - wire a full-res plate to hires_images."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 4, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -2669,10 +2669,43 @@ class PoseAndFaceDetectionV2:
         reference_smooth = crop_mode_str == "reference_smooth"
         jitterless = crop_mode_str == "jitterless"
         crop_off = crop_mode_str == "default"
+        action_mode = crop_mode_str == "action"
 
         if crop_off:
             # ── default: raw detected bboxes, no smoothing, no constant-size ──
             face_bboxes = list(raw_face_bboxes)
+        elif action_mode:
+            # ── action: constant-size box on a hold-then-jump path ─────────
+            # Planner is pure numpy (action_planner.py) so its guarantees are
+            # asserted in tests/test_action_planner.py without ComfyUI. It
+            # RAISES on an infeasible lock rather than degrading to per-frame
+            # boxes, which would silently reintroduce the breathing this mode
+            # exists to remove.
+            from .action_planner import ActionPlanError, plan_action_boxes
+
+            _det_flags = [
+                (float(b[2]) - float(b[0])) > 1.0 and (float(b[3]) - float(b[1])) > 1.0
+                for b in raw_face_bboxes
+            ]
+            try:
+                _plan = plan_action_boxes(
+                    [[float(v) for v in b[:4]] for b in raw_face_bboxes],
+                    image_w=W,
+                    image_h=H,
+                    size=(float(frame0_size) if int(frame0_size) > 0 else None),
+                    safety_margin=float(crop_safety_margin),
+                    deadband_px=float(crop_containment_tolerance),
+                    detected=_det_flags,
+                )
+            except ActionPlanError as exc:
+                raise RuntimeError(
+                    "PoseAndFaceDetectionV2: " + str(exc)
+                ) from exc
+            log.info("[WanAnimateV2] %s", _plan.report)
+            face_bboxes = [
+                (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                for b in _plan.boxes
+            ]
         elif reference_smooth or expression_lock:
             # ── reference_smooth ─────────────────────────────────────────
             # The reference framing, de-jittered. Nothing about the GEOMETRY
